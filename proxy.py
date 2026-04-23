@@ -1,5 +1,7 @@
 import asyncio
 import time
+import importlib
+import os
 
 SERVER_IP = "127.0.0.1"
 SERVER_PORT = 19132
@@ -9,6 +11,15 @@ LISTEN_PORT = 19133
 
 sessions = {}
 SESSION_TIMEOUT = 30
+
+PACKET_RATE_LIMIT = 200
+
+stats = {
+    "packets_in": 0,
+    "packets_out": 0
+}
+
+plugins = []
 
 
 def load_config():
@@ -37,6 +48,21 @@ def load_config():
         print("[Config] config.txt not found, using defaults")
 
 
+def load_plugins():
+    if not os.path.isdir("plugins"):
+        os.mkdir("plugins")
+
+    for file in os.listdir("plugins"):
+        if file.endswith(".py"):
+            name = file[:-3]
+            try:
+                module = importlib.import_module(f"plugins.{name}")
+                plugins.append(module)
+                print(f"[Plugin] Loaded {name}")
+            except Exception as e:
+                print(f"[Plugin] Failed {name}: {e}")
+
+
 class BedrockProxy(asyncio.DatagramProtocol):
     def __init__(self):
         self.transport = None
@@ -44,29 +70,60 @@ class BedrockProxy(asyncio.DatagramProtocol):
     def connection_made(self, transport):
         self.transport = transport
         print(f"[Proxy] Listening on {LISTEN_IP}:{LISTEN_PORT}")
+
         asyncio.create_task(self.cleanup_sessions())
+        asyncio.create_task(self.print_stats())
 
     def datagram_received(self, data, addr):
         now = time.time()
+        stats["packets_in"] += 1
 
-        if addr not in sessions:
+        session = sessions.get(addr)
+
+        if not session:
             sessions[addr] = {
                 "creating": True,
-                "last_seen": now
+                "last_seen": now,
+                "packet_count": 0,
+                "last_reset": now
             }
 
             print(f"[Proxy] New client: {addr}")
+
+            for plugin in plugins:
+                if hasattr(plugin, "on_connect"):
+                    plugin.on_connect(addr)
+
             asyncio.create_task(self.create_session(addr, data))
             return
 
-        session = sessions[addr]
+        if now - session["last_reset"] >= 1:
+            session["packet_count"] = 0
+            session["last_reset"] = now
+
+        session["packet_count"] += 1
+
+        if session["packet_count"] > PACKET_RATE_LIMIT:
+            return
+
         session["last_seen"] = now
 
         if "transport" in session:
+
+            for plugin in plugins:
+                if hasattr(plugin, "on_client_packet"):
+                    result = plugin.on_client_packet(data, addr)
+                    if result is None:
+                        return
+                    data = result
+
             session["transport"].sendto(data)
 
     async def create_session(self, addr, first_packet):
         loop = asyncio.get_running_loop()
+
+        if "transport" in sessions.get(addr, {}):
+            return
 
         try:
             transport, protocol = await loop.create_datagram_endpoint(
@@ -76,7 +133,9 @@ class BedrockProxy(asyncio.DatagramProtocol):
 
             sessions[addr] = {
                 "transport": transport,
-                "last_seen": time.time()
+                "last_seen": time.time(),
+                "packet_count": 0,
+                "last_reset": time.time()
             }
 
             print(f"[Session] Created for {addr}")
@@ -91,18 +150,29 @@ class BedrockProxy(asyncio.DatagramProtocol):
         while True:
             now = time.time()
 
-            to_delete = [
-                addr for addr, s in sessions.items()
-                if now - s.get("last_seen", 0) > SESSION_TIMEOUT
-            ]
+            for addr in list(sessions.keys()):
+                session = sessions.get(addr)
 
-            for addr in to_delete:
-                print(f"[Session] Timeout {addr}")
-                session = sessions.pop(addr, None)
+                if now - session.get("last_seen", 0) > SESSION_TIMEOUT:
+                    print(f"[Session] Timeout {addr}")
 
-                if session and "transport" in session:
-                    session["transport"].close()
+                    for plugin in plugins:
+                        if hasattr(plugin, "on_disconnect"):
+                            plugin.on_disconnect(addr)
 
+                    if "transport" in session:
+                        session["transport"].close()
+
+                    sessions.pop(addr, None)
+
+            await asyncio.sleep(5)
+
+    async def print_stats(self):
+        while True:
+            print(
+                f"[Stats] Clients: {len(sessions)} | "
+                f"In: {stats['packets_in']} | Out: {stats['packets_out']}"
+            )
             await asyncio.sleep(5)
 
 
@@ -112,21 +182,35 @@ class ServerSide(asyncio.DatagramProtocol):
         self.client_addr = client_addr
 
     def datagram_received(self, data, addr):
-        session = sessions.get(self.client_addr)
+        stats["packets_out"] += 1
 
+        session = sessions.get(self.client_addr)
         if session:
             session["last_seen"] = time.time()
+
+        for plugin in plugins:
+            if hasattr(plugin, "on_server_packet"):
+                result = plugin.on_server_packet(data, self.client_addr)
+                if result is None:
+                    return
+                data = result
 
         self.proxy.transport.sendto(data, self.client_addr)
 
     def connection_lost(self, exc):
         if self.client_addr in sessions:
             print(f"[Session] Closed {self.client_addr}")
+
+            for plugin in plugins:
+                if hasattr(plugin, "on_disconnect"):
+                    plugin.on_disconnect(self.client_addr)
+
             sessions.pop(self.client_addr, None)
 
 
 async def main():
     load_config()
+    load_plugins()
 
     loop = asyncio.get_running_loop()
 
