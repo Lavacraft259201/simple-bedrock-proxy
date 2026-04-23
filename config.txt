@@ -1,0 +1,4 @@
+server-name=eu.lifeboat.games
+port=19132
+listen-server=0.0.0.0
+listen-port=19132
